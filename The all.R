@@ -1,3 +1,149 @@
+# GEO Data Analysis Pipeline
+# Comprehensive script for processing, analyzing, and visualizing GEO datasets
+
+# Load required libraries
+library(limma)
+library(sva)
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(pROC)
+library(VennDiagram)
+library(GSVA)
+library(GSEABase)
+library(pheatmap)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(linkET)
+
+# Set working directory
+setwd("C:\\GSE")
+
+###############################################################################
+# 1. DATA PREPROCESSING AND NORMALIZATION
+###############################################################################
+
+process_geo_data <- function(inputFile, conFile, treatFile, geoID) {
+  # Read and preprocess the gene expression matrix
+  rt <- read.table(inputFile, header = TRUE, sep = "\t", check.names = FALSE)
+  rt <- as.matrix(rt)
+  rownames(rt) <- rt[, 1]
+  exp <- rt[, 2:ncol(rt)]
+  dimnames <- list(rownames(exp), colnames(exp))
+  data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
+  rt <- avereps(data)  # Average replicates
+  
+  # Check if data needs log2 transformation
+  qx <- as.numeric(quantile(rt, c(0, 0.25, 0.5, 0.75, 0.99, 1.0), na.rm = TRUE))
+  LogC <- ((qx[5] > 100) || ((qx[6] - qx[1]) > 50 && qx[2] > 0))
+  if (LogC) {
+    rt[rt < 0] <- 0
+    rt <- log2(rt + 1)
+  }
+  
+  # Normalize between arrays
+  data <- normalizeBetweenArrays(rt)
+  
+  # Read sample information files
+  sample1 <- read.table(conFile, header = FALSE, sep = "\t", check.names = FALSE)
+  sample2 <- read.table(treatFile, header = FALSE, sep = "\t", check.names = FALSE)
+  sampleName1 <- gsub("^ | $", "", as.vector(sample1[, 1]))
+  sampleName2 <- gsub("^ | $", "", as.vector(sample2[, 1]))
+  
+  # Extract control and treatment data
+  conData <- data[, sampleName1]
+  treatData <- data[, sampleName2]
+  data <- cbind(conData, treatData)
+  conNum <- ncol(conData)
+  treatNum <- ncol(treatData)
+  
+  # Add sample type information to column names
+  Type <- c(rep("Control", conNum), rep("Treat", treatNum))
+  outData <- rbind(id = paste0(colnames(data), "_", Type), data)
+  
+  # Write normalized data to file
+  write.table(outData, file = paste0(geoID, ".normalize.txt"), 
+              sep = "\t", quote = FALSE, col.names = FALSE)
+  
+  return(data)
+}
+
+###############################################################################
+# 2. DATA INTEGRATION AND BATCH CORRECTION
+###############################################################################
+
+integrate_and_batch_correct <- function() {
+  # Find all files ending with "normalize.txt" in the directory
+  files <- dir()
+  files <- grep("normalize.txt$", files, value = TRUE)
+  geneList <- list()
+  
+  # Read gene information from all txt files and store in geneList
+  for(file in files){
+    if(file == "merge.preNorm.txt") next
+    if(file == "merge.normalize.txt") next
+    
+    rt <- read.table(file, header = TRUE, sep = "\t", check.names = FALSE)
+    geneNames <- as.vector(rt[, 1])
+    uniqGene <- unique(geneNames)
+    header <- unlist(strsplit(file, "\\.|\\-"))
+    geneList[[header[1]]] <- uniqGene
+  }
+  
+  # Find common genes across all datasets
+  interGenes <- Reduce(intersect, geneList)
+  
+  # Merge data from all files
+  allTab <- data.frame()
+  batchType <- c()
+  for(i in 1:length(files)){
+    inputFile <- files[i]
+    if(inputFile == "merge.preNorm.txt") next
+    if(inputFile == "merge.normalize.txt") next
+    
+    header <- unlist(strsplit(inputFile, "\\.|\\-"))
+    
+    # Read and preprocess data file
+    rt <- read.table(inputFile, header = TRUE, sep = "\t", check.names = FALSE)
+    rt <- as.matrix(rt)
+    rownames(rt) <- rt[, 1]
+    exp <- rt[, 2:ncol(rt)]
+    dimnames <- list(rownames(exp), colnames(exp))
+    data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
+    rt <- avereps(data)
+    colnames(rt) <- paste0(header[1], "_", colnames(rt))
+    
+    # Merge data
+    if(i == 1){
+      allTab <- rt[interGenes, ]
+    } else {
+      allTab <- cbind(allTab, rt[interGenes, ])
+    }
+    batchType <- c(batchType, rep(i, ncol(rt)))
+  }
+  
+  # Save merged data before batch correction
+  outTab <- rbind(geneNames = colnames(allTab), allTab)
+  write.table(outTab, file = "merge.preNorm.txt", sep = "\t", quote = FALSE, col.names = FALSE)
+  
+  # Perform batch correction using ComBat
+  outTab <- ComBat(allTab, batchType, par.prior = TRUE)
+  outTab <- rbind(geneNames = colnames(outTab), outTab)
+  write.table(outTab, file = "merge.normalize.txt", sep = "\t", quote = FALSE, col.names = FALSE)
+  
+  return(outTab)
+}
+
+###############################################################################
+# 3. DATA VISUALIZATION
+###############################################################################
+
 # Function to create boxplots for data visualization
 bioBoxplot <- function(inputFile = NULL, outFile = NULL, titleName = NULL) {
   # Read data file
@@ -24,11 +170,6 @@ bioBoxplot <- function(inputFile = NULL, outFile = NULL, titleName = NULL) {
   dev.off()
 }
 
-# Create boxplots before and after batch correction
-bioBoxplot(inputFile = "merge.preNorm.txt", outFile = "boxplot.preNorm.pdf", 
-           titleName = "Before batch correction")
-bioBoxplot(inputFile = "merge.normalize.txt", outFile = "boxplot.normalize.pdf", 
-           titleName = "After batch correction")
 # Function for PCA analysis
 bioPCA <- function(inputFile = NULL, outFile = NULL, titleName = NULL) {
   # Read data file
@@ -53,566 +194,597 @@ bioPCA <- function(inputFile = NULL, outFile = NULL, titleName = NULL) {
   dev.off()
 }
 
-# Perform PCA before and after batch correction
-bioPCA(inputFile = "merge.preNorm.txt", outFile = "PCA.preNorm.pdf", 
-       titleName = "Before batch correction")
-bioPCA(inputFile = "merge.normalize.txt", outFile = "PCA.normalize.pdf", 
-       titleName = "After batch correction")
+###############################################################################
+# 4. DIFFERENTIAL EXPRESSION ANALYSIS
+###############################################################################
 
-# Set parameters for differential expression analysis
-logFCfilter <- 0.585
-adj.P.Val.Filter <- 0.05
-inputFile <- "merge.normalize.txt"
-
-# Read and preprocess data
-rt <- read.table(inputFile, header = TRUE, sep = "\t", check.names = FALSE)
-rt <- as.matrix(rt)
-rownames(rt) <- rt[, 1]
-exp <- rt[, 2:ncol(rt)]
-dimnames <- list(rownames(exp), colnames(exp))
-data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
-data <- avereps(data)
-
-# Extract sample information
-Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
-data <- data[, order(Type)]
-Project <- gsub("(.+)\\_(.+)\\_(.+)", "\\1", colnames(data))
-Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
-colnames(data) <- gsub("(.+)\\_(.+)\\_(.+)", "\\2", colnames(data))
-
-# Design matrix for differential expression
-design <- model.matrix(~0 + factor(Type))
-colnames(design) <- c("Control", "Treat")
-fit <- lmFit(data, design)
-cont.matrix <- makeContrasts(Treat - Control, levels = design)
-fit2 <- contrasts.fit(fit, cont.matrix)
-fit2 <- eBayes(fit2)
-
-# Extract differential expression results
-allDiff <- topTable(fit2, adjust = 'fdr', number = 200000)
-allDiffOut <- rbind(id = colnames(allDiff), allDiff)
-write.table(allDiffOut, file = "all.txt", sep = "\t", quote = FALSE, col.names = FALSE)
-
-# Extract significant differential expression results
-diffSig <- allDiff[with(allDiff, (abs(logFC) > logFCfilter & adj.P.Val < adj.P.Val.Filter)), ]
-diffSigOut <- rbind(id = colnames(diffSig), diffSig)
-write.table(diffSigOut, file = "diff.txt", sep = "\t", quote = FALSE, col.names = FALSE)
-
-# Extract expression of differentially expressed genes
-diffGeneExp <- data[row.names(diffSig), ]
-diffGeneExpOut <- rbind(id = paste0(colnames(diffGeneExp), "_", Type), diffGeneExp)
-write.table(diffGeneExpOut, file = "diffGeneExp.txt", sep = "\t", quote = FALSE, col.names = FALSE)
-
-# Create heatmap of top differentially expressed genes
-geneNum <- 50
-diffUp <- diffSig[diffSig$logFC > 0, ]
-diffDown <- diffSig[diffSig$logFC < 0, ]
-geneUp <- row.names(diffUp)
-geneDown <- row.names(diffDown)
-if (nrow(diffUp) > geneNum) { geneUp <- row.names(diffUp)[1:geneNum] }
-if (nrow(diffDown) > geneNum) { geneDown <- row.names(diffDown)[1:geneNum] }
-hmExp <- data[c(geneUp, geneDown), ]
-
-# Prepare annotation data
-names(Type) <- colnames(data)
-Type <- as.data.frame(Type)
-Type <- cbind(Project, Type)
-
-# Create heatmap
-pdf(file = "heatmap.pdf", width = 10, height = 7)
-pheatmap(hmExp, 
-         annotation_col = Type, 
-         color = colorRampPalette(c("blue2", "white", "red2"))(50),
-         cluster_cols = FALSE,
-         show_colnames = FALSE,
-         scale = "row",
-         fontsize = 8,
-         fontsize_row = 5.5,
-         fontsize_col = 8)
-dev.off()
-
-# WGCNA analysis function
-expFile <- "merge.normalize.txt"
-
-# Read and preprocess data
-rt <- read.table(expFile, header = TRUE, sep = "\t", check.names = FALSE)
-rt <- as.matrix(rt)
-rownames(rt) <- rt[, 1]
-exp <- rt[, 2:ncol(rt)]
-dimnames <- list(rownames(exp), colnames(exp))
-data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
-data <- avereps(data)
-data <- data[apply(data, 1, sd) > 0.5, ]
-
-# Extract sample information
-Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
-conCount <- length(Type[Type == "Control"])
-treatCount <- length(Type[Type == "Treat"])
-datExpr0 <- t(data)
-
-# Check for missing values
-gsg <- goodSamplesGenes(datExpr0, verbose = 3)
-if (!gsg$allOK) {
-  if (sum(!gsg$goodGenes) > 0)
-    printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")))
-  if (sum(!gsg$goodSamples) > 0)
-    printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")))
-  datExpr0 <- datExpr0[gsg$goodSamples, gsg$goodGenes]
+perform_de_analysis <- function(inputFile = "merge.normalize.txt", 
+                                logFCfilter = 0.585, 
+                                adj.P.Val.Filter = 0.05) {
+  # Read and preprocess data
+  rt <- read.table(inputFile, header = TRUE, sep = "\t", check.names = FALSE)
+  rt <- as.matrix(rt)
+  rownames(rt) <- rt[, 1]
+  exp <- rt[, 2:ncol(rt)]
+  dimnames <- list(rownames(exp), colnames(exp))
+  data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
+  data <- avereps(data)
+  
+  # Extract sample information
+  Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
+  data <- data[, order(Type)]
+  Project <- gsub("(.+)\\_(.+)\\_(.+)", "\\1", colnames(data))
+  Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
+  colnames(data) <- gsub("(.+)\\_(.+)\\_(.+)", "\\2", colnames(data))
+  
+  # Design matrix for differential expression
+  design <- model.matrix(~0 + factor(Type))
+  colnames(design) <- c("Control", "Treat")
+  fit <- lmFit(data, design)
+  cont.matrix <- makeContrasts(Treat - Control, levels = design)
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+  
+  # Extract differential expression results
+  allDiff <- topTable(fit2, adjust = 'fdr', number = 200000)
+  allDiffOut <- rbind(id = colnames(allDiff), allDiff)
+  write.table(allDiffOut, file = "all.txt", sep = "\t", quote = FALSE, col.names = FALSE)
+  
+  # Extract significant differential expression results
+  diffSig <- allDiff[with(allDiff, (abs(logFC) > logFCfilter & adj.P.Val < adj.P.Val.Filter)), ]
+  diffSigOut <- rbind(id = colnames(diffSig), diffSig)
+  write.table(diffSigOut, file = "diff.txt", sep = "\t", quote = FALSE, col.names = FALSE)
+  
+  # Extract expression of differentially expressed genes
+  diffGeneExp <- data[row.names(diffSig), ]
+  diffGeneExpOut <- rbind(id = paste0(colnames(diffGeneExp), "_", Type), diffGeneExp)
+  write.table(diffGeneExpOut, file = "diffGeneExp.txt", sep = "\t", quote = FALSE, col.names = FALSE)
+  
+  # Create heatmap of top differentially expressed genes
+  geneNum <- 50
+  diffUp <- diffSig[diffSig$logFC > 0, ]
+  diffDown <- diffSig[diffSig$logFC < 0, ]
+  geneUp <- row.names(diffUp)
+  geneDown <- row.names(diffDown)
+  if (nrow(diffUp) > geneNum) { geneUp <- row.names(diffUp)[1:geneNum] }
+  if (nrow(diffDown) > geneNum) { geneDown <- row.names(diffDown)[1:geneNum] }
+  hmExp <- data[c(geneUp, geneDown), ]
+  
+  # Prepare annotation data
+  names(Type) <- colnames(data)
+  Type <- as.data.frame(Type)
+  Type <- cbind(Project, Type)
+  
+  # Create heatmap
+  pdf(file = "heatmap.pdf", width = 10, height = 7)
+  pheatmap(hmExp, 
+           annotation_col = Type, 
+           color = colorRampPalette(c("blue2", "white", "red2"))(50),
+           cluster_cols = FALSE,
+           show_colnames = FALSE,
+           scale = "row",
+           fontsize = 8,
+           fontsize_row = 5.5,
+           fontsize_col = 8)
+  dev.off()
+  
+  return(diffSig)
 }
 
-# Sample clustering to detect outliers
-sampleTree <- hclust(dist(datExpr0), method = "average")
-pdf(file = "1_sample_cluster.pdf", width = 9, height = 6)
-par(cex = 0.6)
-par(mar = c(0, 4, 2, 0))
-plot(sampleTree, main = "Sample clustering to detect outliers", sub = "", xlab = "", 
-     cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
-abline(h = 20000, col = "red")
-dev.off()
+###############################################################################
+# 5. WGCNA ANALYSIS
+###############################################################################
 
-# Remove outliers
-clust <- cutreeStatic(sampleTree, cutHeight = 20000, minSize = 10)
-table(clust)
-keepSamples <- (clust == 1)
-datExpr0 <- datExpr0[keepSamples, ]
+perform_wgcna_analysis <- function(expFile = "merge.normalize.txt") {
+  # Read and preprocess data
+  rt <- read.table(expFile, header = TRUE, sep = "\t", check.names = FALSE)
+  rt <- as.matrix(rt)
+  rownames(rt) <- rt[, 1]
+  exp <- rt[, 2:ncol(rt)]
+  dimnames <- list(rownames(exp), colnames(exp))
+  data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
+  data <- avereps(data)
+  data <- data[apply(data, 1, sd) > 0.5, ]
+  
+  # Extract sample information
+  Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
+  conCount <- length(Type[Type == "Control"])
+  treatCount <- length(Type[Type == "Treat"])
+  datExpr0 <- t(data)
+  
+  # Check for missing values
+  gsg <- goodSamplesGenes(datExpr0, verbose = 3)
+  if (!gsg$allOK) {
+    if (sum(!gsg$goodGenes) > 0)
+      printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")))
+    if (sum(!gsg$goodSamples) > 0)
+      printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")))
+    datExpr0 <- datExpr0[gsg$goodSamples, gsg$goodGenes]
+  }
+  
+  # Sample clustering to detect outliers
+  sampleTree <- hclust(dist(datExpr0), method = "average")
+  pdf(file = "1_sample_cluster.pdf", width = 9, height = 6)
+  par(cex = 0.6)
+  par(mar = c(0, 4, 2, 0))
+  plot(sampleTree, main = "Sample clustering to detect outliers", sub = "", xlab = "", 
+       cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+  abline(h = 20000, col = "red")
+  dev.off()
+  
+  # Remove outliers
+  clust <- cutreeStatic(sampleTree, cutHeight = 20000, minSize = 10)
+  table(clust)
+  keepSamples <- (clust == 1)
+  datExpr0 <- datExpr0[keepSamples, ]
+  
+  # Prepare trait data
+  traitData <- data.frame(Control = c(rep(1, conCount), rep(0, treatCount)),
+                          Treat = c(rep(0, conCount), rep(1, treatCount)))
+  row.names(traitData) <- colnames(data)
+  fpkmSamples <- rownames(datExpr0)
+  traitSamples <- rownames(traitData)
+  sameSample <- intersect(fpkmSamples, traitSamples)
+  datExpr0 <- datExpr0[sameSample, ]
+  datTraits <- traitData[sameSample, ]
+  
+  # Sample clustering with trait heatmap
+  sampleTree2 <- hclust(dist(datExpr0), method = "average")
+  traitColors <- numbers2colors(datTraits, signed = FALSE)
+  pdf(file = "2_sample_heatmap.pdf", width = 9, height = 7)
+  plotDendroAndColors(sampleTree2, traitColors,
+                      groupLabels = names(datTraits),
+                      main = "Sample dendrogram and trait heatmap")
+  dev.off()
+  
+  # Soft threshold selection
+  enableWGCNAThreads()
+  powers <- c(1:20)
+  sft <- pickSoftThreshold(datExpr0, powerVector = powers, verbose = 5)
+  pdf(file = "3_scale_independence.pdf", width = 9, height = 5)
+  par(mfrow = c(1, 2))
+  cex1 <- 0.9
+  plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+       xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2", type = "n",
+       main = paste("Scale independence"))
+  text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+       labels = powers, cex = cex1, col = "red")
+  abline(h = 0.8, col = "red")
+  plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+       xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", type = "n",
+       main = paste("Mean connectivity"))
+  text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, cex = cex1, col = "red")
+  dev.off()
+  
+  # Determine soft threshold power
+  sft
+  softPower <- sft$powerEstimate
+  adjacency <- adjacency(datExpr0, power = softPower)
+  softPower
+  
+  # TOM matrix
+  TOM <- TOMsimilarity(adjacency)
+  dissTOM <- 1 - TOM
+  
+  # Gene clustering
+  geneTree <- hclust(as.dist(dissTOM), method = "average")
+  pdf(file = "4_gene_clustering.pdf", width = 8, height = 6)
+  plot(geneTree, xlab = "", sub = "", main = "Gene clustering on TOM-based dissimilarity",
+       labels = FALSE, hang = 0.04)
+  dev.off()
+  
+  # Module identification
+  minModuleSize <- 60
+  dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                               deepSplit = 2, pamRespectsDendro = FALSE,
+                               minClusterSize = minModuleSize)
+  table(dynamicMods)
+  dynamicColors <- labels2colors(dynamicMods)
+  table(dynamicColors)
+  pdf(file = "5_Dynamic_Tree.pdf", width = 8, height = 6)
+  plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                      dendroLabels = FALSE, hang = 0.03,
+                      addGuide = TRUE, guideHang = 0.05,
+                      main = "Gene dendrogram and module colors")
+  dev.off()
+  
+  # Module eigengenes
+  MEList <- moduleEigengenes(datExpr0, colors = dynamicColors)
+  MEs <- MEList$eigengenes
+  MEDiss <- 1 - cor(MEs)
+  METree <- hclust(as.dist(MEDiss), method = "average")
+  pdf(file = "6_Clustering_module.pdf", width = 7, height = 6)
+  plot(METree, main = "Clustering of module eigengenes",
+       xlab = "", sub = "")
+  MEDissThres <- 0.25
+  abline(h = MEDissThres, col = "red")
+  dev.off()
+  
+  # Merge similar modules
+  merge <- mergeCloseModules(datExpr0, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+  mergedColors <- merge$colors
+  mergedMEs <- merge$newMEs
+  pdf(file = "7_merged_dynamic.pdf", width = 8, height = 6)
+  plotDendroAndColors(geneTree, mergedColors, "Merged dynamic",
+                      dendroLabels = FALSE, hang = 0.03,
+                      addGuide = TRUE, guideHang = 0.05,
+                      main = "Gene dendrogram and module colors")
+  dev.off()
+  moduleColors <- mergedColors
+  table(moduleColors)
+  colorOrder <- c("grey", standardColors(50))
+  moduleLabels <- match(moduleColors, colorOrder) - 1
+  MEs <- mergedMEs
+  
+  # Module-trait relationships
+  nGenes <- ncol(datExpr0)
+  nSamples <- nrow(datExpr0)
+  moduleTraitCor <- cor(MEs, datTraits, use = "p")
+  moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+  pdf(file = "8_Module_trait.pdf", width = 5.5, height = 5.5)
+  textMatrix <- paste(signif(moduleTraitCor, 2), "\n(",
+                      signif(moduleTraitPvalue, 1), ")", sep = "")
+  dim(textMatrix) <- dim(moduleTraitCor)
+  par(mar = c(5, 10, 3, 3))
+  labeledHeatmap(Matrix = moduleTraitCor,
+                 xLabels = names(datTraits),
+                 yLabels = names(MEs),
+                 ySymbols = names(MEs),
+                 colorLabels = FALSE,
+                 colors = blueWhiteRed(50),
+                 textMatrix = textMatrix,
+                 setStdMargins = FALSE,
+                 cex.text = 0.75,
+                 zlim = c(-1, 1),
+                 main = paste("Module-trait relationships"))
+  dev.off()
+  
+  # Calculate module membership and gene significance
+  modNames <- substring(names(MEs), 3)
+  geneModuleMembership <- as.data.frame(cor(datExpr0, MEs, use = "p"))
+  MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+  names(geneModuleMembership) <- paste("MM", modNames, sep = "")
+  names(MMPvalue) <- paste("p.MM", modNames, sep = "")
+  traitNames <- names(datTraits)
+  geneTraitSignificance <- as.data.frame(cor(datExpr0, datTraits, use = "p"))
+  GSPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
+  names(geneTraitSignificance) <- paste("GS.", traitNames, sep = "")
+  names(GSPvalue) <- paste("p.GS.", traitNames, sep = "")
+  
+  # Module significance
+  y <- datTraits[, 1]
+  GS1 <- as.numeric(cor(y, datExpr0, use = "p"))
+  GeneSignificance <- abs(GS1)
+  ModuleSignificance <- tapply(GeneSignificance, mergedColors, mean, na.rm = TRUE)
+  pdf(file = "9_GeneSignificance.pdf", width = 12.5, height = 7.5)
+  plotModuleSignificance(GeneSignificance, mergedColors)
+  dev.off()
+  
+  # Scatter plots of module membership vs gene significance
+  trait <- "Treat"
+  traitColumn <- match(trait, traitNames)
+  for (module in modNames) {
+    column <- match(module, modNames)
+    moduleGenes <- moduleColors == module
+    if (nrow(geneModuleMembership[moduleGenes, ]) > 1) {
+      outPdf <- paste("10_", trait, "_", module, ".pdf", sep = "")
+      pdf(file = outPdf, width = 7, height = 7)
+      par(mfrow = c(1, 1))
+      verboseScatterplot(abs(geneModuleMembership[moduleGenes, column]),
+                         abs(geneTraitSignificance[moduleGenes, traitColumn]),
+                         xlab = paste("Module Membership in", module, "module"),
+                         ylab = paste("Gene significance for ", trait),
+                         main = paste("Module membership vs. gene significance\n"),
+                         cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2, col = module)
+      dev.off()
+    }
+  }
+  
+  # Create gene information table
+  probes <- colnames(datExpr0)
+  geneInfo0 <- data.frame(probes = probes,
+                          moduleColor = moduleColors)
+  for (Tra in 1:ncol(geneTraitSignificance)) {
+    oldNames <- names(geneInfo0)
+    geneInfo0 <- data.frame(geneInfo0, geneTraitSignificance[, Tra],
+                            GSPvalue[, Tra])
+    names(geneInfo0) <- c(oldNames, names(geneTraitSignificance)[Tra],
+                          names(GSPvalue)[Tra])
+  }
+  
+  for (mod in 1:ncol(geneModuleMembership)) {
+    oldNames <- names(geneInfo0)
+    geneInfo0 <- data.frame(geneInfo0, geneModuleMembership[, mod],
+                            MMPvalue[, mod])
+    names(geneInfo0) <- c(oldNames, names(geneModuleMembership)[mod],
+                          names(MMPvalue)[mod])
+  }
+  geneOrder <- order(geneInfo0$moduleColor)
+  geneInfo <- geneInfo0[geneOrder, ]
+  write.table(geneInfo, file = "GS_MM.xls", sep = "\t", row.names = FALSE)
+  
+  # Export genes in each module
+  for (mod in 1:nrow(table(moduleColors))) {
+    modules <- names(table(moduleColors))[mod]
+    probes <- colnames(datExpr0)
+    inModule <- (moduleColors == modules)
+    modGenes <- probes[inModule]
+    write.table(modGenes, file = paste0("module_", modules, ".txt"), sep = "\t", 
+                row.names = FALSE, col.names = FALSE, quote = FALSE)
+  }
+  
+  return(list(moduleColors = moduleColors, MEs = MEs, geneInfo = geneInfo))
+}
 
-# Prepare trait data
-traitData <- data.frame(Control = c(rep(1, conCount), rep(0, treatCount)),
-                        Treat = c(rep(0, conCount), rep(1, treatCount)))
-row.names(traitData) <- colnames(data)
-fpkmSamples <- rownames(datExpr0)
-traitSamples <- rownames(traitData)
-sameSample <- intersect(fpkmSamples, traitSamples)
-datExpr0 <- datExpr0[sameSample, ]
-datTraits <- traitData[sameSample, ]
+###############################################################################
+# 6. ENRICHMENT ANALYSIS
+###############################################################################
 
-# Sample clustering with trait heatmap
-sampleTree2 <- hclust(dist(datExpr0), method = "average")
-traitColors <- numbers2colors(datTraits, signed = FALSE)
-pdf(file = "2_sample_heatmap.pdf", width = 9, height = 7)
-plotDendroAndColors(sampleTree2, traitColors,
-                    groupLabels = names(datTraits),
-                    main = "Sample dendrogram and trait heatmap")
-dev.off()
+perform_go_enrichment <- function(geneFile = "interGenes1.txt", 
+                                  pvalueFilter = 0.05, 
+                                  adjPvalFilter = 1) {
+  # Set color scheme
+  colorSel <- "p.adjust"
+  if (adjPvalFilter > 0.05) {
+    colorSel <- "pvalue"
+  }
+  
+  # Read gene list
+  rt <- read.table(geneFile, header = FALSE, sep = "\t", check.names = FALSE)
+  
+  # Convert gene symbols to Entrez IDs
+  genes <- unique(as.vector(rt[, 1]))
+  entrezIDs <- mget(genes, org.Hs.egSYMBOL2EG, ifnotfound = NA)
+  entrezIDs <- as.character(entrezIDs)
+  rt <- cbind(rt, entrezIDs)
+  rt <- rt[rt[, "entrezIDs"] != "NA", ]
+  gene <- rt$entrezID
+  
+  # Perform GO enrichment
+  kk <- enrichGO(gene = gene, OrgDb = org.Hs.eg.db, pvalueCutoff = 1, 
+                 qvalueCutoff = 1, ont = "all", readable = TRUE)
+  GO <- as.data.frame(kk)
+  GO <- GO[(GO$pvalue < pvalueFilter & GO$p.adjust < adjPvalFilter), ]
+  write.table(GO, file = "GO.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  # Create barplot
+  pdf(file = "barplot.pdf", width = 9, height = 7)
+  bar <- barplot(kk, drop = TRUE, showCategory = 10, label_format = 100, 
+                 split = "ONTOLOGY", color = colorSel) + facet_grid(ONTOLOGY ~ ., scale = 'free')
+  print(bar)
+  dev.off()
+  
+  # Create bubble plot
+  pdf(file = "bubble.pdf", width = 9, height = 7)
+  bub <- dotplot(kk, showCategory = 10, orderBy = "GeneRatio", label_format = 100, 
+                 split = "ONTOLOGY", color = colorSel) + facet_grid(ONTOLOGY ~ ., scale = 'free')
+  print(bub)
+  dev.off()
+  
+  return(GO)
+}
 
-# Soft threshold selection
-enableWGCNAThreads()
-powers <- c(1:20)
-sft <- pickSoftThreshold(datExpr0, powerVector = powers, verbose = 5)
-pdf(file = "3_scale_independence.pdf", width = 9, height = 5)
-par(mfrow = c(1, 2))
-cex1 <- 0.9
-plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2", type = "n",
-     main = paste("Scale independence"))
-text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-     labels = powers, cex = cex1, col = "red")
-abline(h = 0.8, col = "red")
-plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
-     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", type = "n",
-     main = paste("Mean connectivity"))
-text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, cex = cex1, col = "red")
-dev.off()
+perform_kegg_enrichment <- function(geneFile = "interGenes1.txt", 
+                                    pvalueFilter = 0.05, 
+                                    adjPvalFilter = 1) {
+  # Set color scheme
+  colorSel <- "p.adjust"
+  if (adjPvalFilter > 0.05) {
+    colorSel <- "pvalue"
+  }
+  
+  # Read gene list
+  rt <- read.table(geneFile, header = FALSE, sep = "\t", check.names = FALSE)
+  
+  # Convert gene symbols to Entrez IDs
+  genes <- unique(as.vector(rt[, 1]))
+  entrezIDs <- mget(genes, org.Mm.egSYMBOL2EG, ifnotfound = NA)
+  entrezIDs <- as.character(entrezIDs)
+  rt <- cbind(rt, entrezIDs)
+  colnames(rt)[1] <- "gene"
+  rt <- rt[rt[, "entrezIDs"] != "NA", ]
+  gene <- rt$entrezID
+  
+  # Perform KEGG enrichment
+  kk <- enrichKEGG(gene = gene, organism = "mmu", pvalueCutoff = 1, qvalueCutoff = 1)
+  kk@result$Description <- gsub(" - Homo sapiens \\(human\\)", "", kk@result$Description)
+  KEGG <- as.data.frame(kk)
+  KEGG$geneID <- as.character(sapply(KEGG$geneID, function(x) {
+    paste(rt$gene[match(strsplit(x, "/")[[1]], as.character(rt$entrezID))], collapse = "/")
+  }))
+  KEGG <- KEGG[(KEGG$pvalue < pvalueFilter & KEGG$p.adjust < adjPvalFilter), ]
+  write.table(KEGG, file = "KEGG.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  # Determine number of pathways to show
+  showNum <- 30
+  if (nrow(KEGG) < showNum) {
+    showNum <- nrow(KEGG)
+  }
+  
+  # Create barplot
+  pdf(file = "barplot.pdf", width = 8.5, height = 7)
+  barplot(kk, drop = TRUE, showCategory = showNum, label_format = 100, color = colorSel)
+  dev.off()
+  
+  # Create bubble plot
+  pdf(file = "bubble.pdf", width = 8.5, height = 7)
+  dotplot(kk, showCategory = showNum, orderBy = "GeneRatio", label_format = 100, color = colorSel)
+  dev.off()
+  
+  return(KEGG)
+}
 
-# Determine soft threshold power
-sft
-softPower <- sft$powerEstimate
-adjacency <- adjacency(datExpr0, power = softPower)
-softPower
+###############################################################################
+# 7. GSEA AND GSVA ANALYSIS
+###############################################################################
 
-# TOM matrix
-TOM <- TOMsimilarity(adjacency)
-dissTOM <- 1 - TOM
-
-# Gene clustering
-geneTree <- hclust(as.dist(dissTOM), method = "average")
-pdf(file = "4_gene_clustering.pdf", width = 8, height = 6)
-plot(geneTree, xlab = "", sub = "", main = "Gene clustering on TOM-based dissimilarity",
-     labels = FALSE, hang = 0.04)
-dev.off()
-
-# Module identification
-minModuleSize <- 60
-dynamicMods <- cutreeDynamic(dendro = geneTree, distM = dissTOM,
-                             deepSplit = 2, pamRespectsDendro = FALSE,
-                             minClusterSize = minModuleSize)
-table(dynamicMods)
-dynamicColors <- labels2colors(dynamicMods)
-table(dynamicColors)
-pdf(file = "5_Dynamic_Tree.pdf", width = 8, height = 6)
-plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
-                    dendroLabels = FALSE, hang = 0.03,
-                    addGuide = TRUE, guideHang = 0.05,
-                    main = "Gene dendrogram and module colors")
-dev.off()
-
-# Module eigengenes
-MEList <- moduleEigengenes(datExpr0, colors = dynamicColors)
-MEs <- MEList$eigengenes
-MEDiss <- 1 - cor(MEs)
-METree <- hclust(as.dist(MEDiss), method = "average")
-pdf(file = "6_Clustering_module.pdf", width = 7, height = 6)
-plot(METree, main = "Clustering of module eigengenes",
-     xlab = "", sub = "")
-MEDissThres <- 0.25
-abline(h = MEDissThres, col = "red")
-dev.off()
-
-# Merge similar modules
-merge <- mergeCloseModules(datExpr0, dynamicColors, cutHeight = MEDissThres, verbose = 3)
-mergedColors <- merge$colors
-mergedMEs <- merge$newMEs
-pdf(file = "7_merged_dynamic.pdf", width = 8, height = 6)
-plotDendroAndColors(geneTree, mergedColors, "Merged dynamic",
-                    dendroLabels = FALSE, hang = 0.03,
-                    addGuide = TRUE, guideHang = 0.05,
-                    main = "Gene dendrogram and module colors")
-dev.off()
-moduleColors <- mergedColors
-table(moduleColors)
-colorOrder <- c("grey", standardColors(50))
-moduleLabels <- match(moduleColors, colorOrder) - 1
-MEs <- mergedMEs
-
-# Module-trait relationships
-nGenes <- ncol(datExpr0)
-nSamples <- nrow(datExpr0)
-moduleTraitCor <- cor(MEs, datTraits, use = "p")
-moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
-pdf(file = "8_Module_trait.pdf", width = 5.5, height = 5.5)
-textMatrix <- paste(signif(moduleTraitCor, 2), "\n(",
-                    signif(moduleTraitPvalue, 1), ")", sep = "")
-dim(textMatrix) <- dim(moduleTraitCor)
-par(mar = c(5, 10, 3, 3))
-labeledHeatmap(Matrix = moduleTraitCor,
-               xLabels = names(datTraits),
-               yLabels = names(MEs),
-               ySymbols = names(MEs),
-               colorLabels = FALSE,
-               colors = blueWhiteRed(50),
-               textMatrix = textMatrix,
-               setStdMargins = FALSE,
-               cex.text = 0.75,
-               zlim = c(-1, 1),
-               main = paste("Module-trait relationships"))
-dev.off()
-
-# Calculate module membership and gene significance
-modNames <- substring(names(MEs), 3)
-geneModuleMembership <- as.data.frame(cor(datExpr0, MEs, use = "p"))
-MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
-names(geneModuleMembership) <- paste("MM", modNames, sep = "")
-names(MMPvalue) <- paste("p.MM", modNames, sep = "")
-traitNames <- names(datTraits)
-geneTraitSignificance <- as.data.frame(cor(datExpr0, datTraits, use = "p"))
-GSPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
-names(geneTraitSignificance) <- paste("GS.", traitNames, sep = "")
-names(GSPvalue) <- paste("p.GS.", traitNames, sep = "")
-
-# Module significance
-y <- datTraits[, 1]
-GS1 <- as.numeric(cor(y, datExpr0, use = "p"))
-GeneSignificance <- abs(GS1)
-ModuleSignificance <- tapply(GeneSignificance, mergedColors, mean, na.rm = TRUE)
-pdf(file = "9_GeneSignificance.pdf", width = 12.5, height = 7.5)
-plotModuleSignificance(GeneSignificance, mergedColors)
-dev.off()
-
-# Scatter plots of module membership vs gene significance
-trait <- "Treat"
-traitColumn <- match(trait, traitNames)
-for (module in modNames) {
-  column <- match(module, modNames)
-  moduleGenes <- moduleColors == module
-  if (nrow(geneModuleMembership[moduleGenes, ]) > 1) {
-    outPdf <- paste("10_", trait, "_", module, ".pdf", sep = "")
-    pdf(file = outPdf, width = 7, height = 7)
-    par(mfrow = c(1, 1))
-    verboseScatterplot(abs(geneModuleMembership[moduleGenes, column]),
-                       abs(geneTraitSignificance[moduleGenes, traitColumn]),
-                       xlab = paste("Module Membership in", module, "module"),
-                       ylab = paste("Gene significance for ", trait),
-                       main = paste("Module membership vs. gene significance\n"),
-                       cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2, col = module)
+perform_gsea_analysis <- function(gene = "FIBP", 
+                                  expFile = "merge.normalize.txt", 
+                                  gmtFile = "c2.cp.kegg.Hs.symbols.gmt") {
+  # Read and preprocess data
+  rt <- read.table(expFile, header = TRUE, sep = "\t", check.names = FALSE)
+  rt <- as.matrix(rt)
+  rownames(rt) <- rt[, 1]
+  exp <- rt[, 2:ncol(rt)]
+  dimnames <- list(rownames(exp), colnames(exp))
+  data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
+  data <- avereps(data)
+  data <- data[rowMeans(data) > 0, ]
+  
+  # Filter for treatment samples
+  Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
+  data <- data[, Type == "Treat", drop = FALSE]
+  
+  # Calculate logFC for target gene
+  dataL <- data[, data[gene, ] < median(data[gene, ]), drop = FALSE]
+  dataH <- data[, data[gene, ] >= median(data[gene, ]), drop = FALSE]
+  meanL <- rowMeans(dataL)
+  meanH <- rowMeans(dataH)
+  meanL[meanL < 0.00001] <- 0.00001
+  meanH[meanH < 0.00001] <- 0.00001
+  logFC <- meanH - meanL
+  logFC <- sort(logFC, decreasing = TRUE)
+  genes <- names(logFC)
+  
+  # Read gene set file
+  gmt <- read.gmt(gmtFile)
+  
+  # Perform GSEA
+  kk <- GSEA(logFC, TERM2GENE = gmt, pvalueCutoff = 1)
+  kkTab <- as.data.frame(kk)
+  kkTab <- kkTab[kkTab$pvalue < 0.05, ]
+  write.table(kkTab, file = "GSEA.result.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  # Create enrichment plots for high expression group
+  termNum <- 5
+  kkUp <- kkTab[kkTab$NES > 0, ]
+  if (nrow(kkUp) >= termNum) {
+    showTerm <- row.names(kkUp)[1:termNum]
+    gseaplot <- gseaplot2(kk, showTerm, base_size = 8, title = "Enriched in high expression group")
+    pdf(file = "GSEA.highExp.pdf", width = 6.5, height = 5.5)
+    print(gseaplot)
     dev.off()
   }
-}
-
-# Create gene information table
-probes <- colnames(datExpr0)
-geneInfo0 <- data.frame(probes = probes,
-                        moduleColor = moduleColors)
-for (Tra in 1:ncol(geneTraitSignificance)) {
-  oldNames <- names(geneInfo0)
-  geneInfo0 <- data.frame(geneInfo0, geneTraitSignificance[, Tra],
-                          GSPvalue[, Tra])
-  names(geneInfo0) <- c(oldNames, names(geneTraitSignificance)[Tra],
-                        names(GSPvalue)[Tra])
-}
-
-for (mod in 1:ncol(geneModuleMembership)) {
-  oldNames <- names(geneInfo0)
-  geneInfo0 <- data.frame(geneInfo0, geneModuleMembership[, mod],
-                          MMPvalue[, mod])
-  names(geneInfo0) <- c(oldNames, names(geneModuleMembership)[mod],
-                        names(MMPvalue)[mod])
-}
-geneOrder <- order(geneInfo0$moduleColor)
-geneInfo <- geneInfo0[geneOrder, ]
-write.table(geneInfo, file = "GS_MM.xls", sep = "\t", row.names = FALSE)
-
-# Export genes in each module
-for (mod in 1:nrow(table(moduleColors))) {
-  modules <- names(table(moduleColors))[mod]
-  probes <- colnames(datExpr0)
-  inModule <- (moduleColors == modules)
-  modGenes <- probes[inModule]
-  write.table(modGenes, file = paste0("module_", modules, ".txt"), sep = "\t", 
-              row.names = FALSE, col.names = FALSE, quote = FALSE)
-}
-
-# Venn diagram analysis
-diffFile <- "diff.txt"
-moduleFile <- "module_red.txt"
-
-# Read differential expression results
-rt <- read.table("diff.txt", header = TRUE, sep = "\t", check.names = FALSE)
-geneNames <- as.vector(rt[, 1])
-geneNames <- gsub("^ | $", "", geneNames)
-uniqGene <- unique(geneNames)
-geneList <- list()
-geneList[["DEG"]] <- uniqGene
-
-# Read module genes
-rt <- read.table(moduleFile, header = FALSE, sep = "\t", check.names = FALSE)
-geneNames <- as.vector(rt[, 1])
-geneNames <- gsub("^ | $", "", geneNames)
-uniqGene <- unique(geneNames)
-geneList[["WGCNA"]] <- uniqGene
-
-# Create Venn diagram
-venn.plot <- venn.diagram(geneList, filename = NULL, fill = c("cornflowerblue", "darkorchid1"),
-                          scaled = FALSE, cat.pos = c(-1, 1), 
-                          cat.col = c("cornflowerblue", "darkorchid1"), cat.cex = 1.2)
-pdf(file = "venn.pdf", width = 5, height = 5)
-grid.draw(venn.plot)
-dev.off()
-
-# Extract intersecting genes
-interGenes <- Reduce(intersect, geneList)
-write.table(interGenes, file = "interGenes.txt", sep = "\t", quote = FALSE, 
-            col.names = FALSE, row.names = FALSE)
-
-# GO enrichment analysis
-pvalueFilter <- 0.05
-adjPvalFilter <- 1
-
-# Set color scheme
-colorSel <- "p.adjust"
-if (adjPvalFilter > 0.05) {
-  colorSel <- "pvalue"
-}
-
-# Read gene list
-rt <- read.table("interGenes1.txt", header = FALSE, sep = "\t", check.names = FALSE)
-
-# Convert gene symbols to Entrez IDs
-genes <- unique(as.vector(rt[, 1]))
-entrezIDs <- mget(genes, org.Hs.egSYMBOL2EG, ifnotfound = NA)
-entrezIDs <- as.character(entrezIDs)
-rt <- cbind(rt, entrezIDs)
-rt <- rt[rt[, "entrezIDs"] != "NA", ]
-gene <- rt$entrezID
-
-# Perform GO enrichment
-kk <- enrichGO(gene = gene, OrgDb = org.Hs.eg.db, pvalueCutoff = 1, 
-               qvalueCutoff = 1, ont = "all", readable = TRUE)
-GO <- as.data.frame(kk)
-GO <- GO[(GO$pvalue < pvalueFilter & GO$p.adjust < adjPvalFilter), ]
-write.table(GO, file = "GO.txt", sep = "\t", quote = FALSE, row.names = FALSE)
-
-# Create barplot
-pdf(file = "barplot.pdf", width = 9, height = 7)
-bar <- barplot(kk, drop = TRUE, showCategory = 10, label_format = 100, 
-               split = "ONTOLOGY", color = colorSel) + facet_grid(ONTOLOGY ~ ., scale = 'free')
-print(bar)
-dev.off()
-
-# Create bubble plot
-pdf(file = "bubble.pdf", width = 9, height = 7)
-bub <- dotplot(kk, showCategory = 10, orderBy = "GeneRatio", label_format = 100, 
-               split = "ONTOLOGY", color = colorSel) + facet_grid(ONTOLOGY ~ ., scale = 'free')
-print(bub)
-dev.off()
-
-# KEGG enrichment analysis
-pvalueFilter <- 0.05
-adjPvalFilter <- 1
-
-# Set color scheme
-colorSel <- "p.adjust"
-if (adjPvalFilter > 0.05) {
-  colorSel <- "pvalue"
-}
-
-# Read gene list
-rt <- read.table("interGenes1.txt", header = FALSE, sep = "\t", check.names = FALSE)
-
-# Convert gene symbols to Entrez IDs
-genes <- unique(as.vector(rt[, 1]))
-entrezIDs <- mget(genes, org.Mm.egSYMBOL2EG, ifnotfound = NA)
-entrezIDs <- as.character(entrezIDs)
-rt <- cbind(rt, entrezIDs)
-colnames(rt)[1] <- "gene"
-rt <- rt[rt[, "entrezIDs"] != "NA", ]
-gene <- rt$entrezID
-
-# Perform KEGG enrichment
-kk <- enrichKEGG(gene = gene, organism = "mmu", pvalueCutoff = 1, qvalueCutoff = 1)
-kk@result$Description <- gsub(" - Homo sapiens \\(human\\)", "", kk@result$Description)
-KEGG <- as.data.frame(kk)
-KEGG$geneID <- as.character(sapply(KEGG$geneID, function(x) {
-  paste(rt$gene[match(strsplit(x, "/")[[1]], as.character(rt$entrezID))], collapse = "/")
-}))
-KEGG <- KEGG[(KEGG$pvalue < pvalueFilter & KEGG$p.adjust < adjPvalFilter), ]
-write.table(KEGG, file = "KEGG.txt", sep = "\t", quote = FALSE, row.names = FALSE)
-
-# Determine number of pathways to show
-showNum <- 30
-if (nrow(KEGG) < showNum) {
-  showNum <- nrow(KEGG)
-}
-
-# Create barplot
-pdf(file = "barplot.pdf", width = 8.5, height = 7)
-barplot(kk, drop = TRUE, showCategory = showNum, label_format = 100, color = colorSel)
-dev.off()
-
-# Create bubble plot
-pdf(file = "bubble.pdf", width = 8.5, height = 7)
-dotplot(kk, showCategory = showNum, orderBy = "GeneRatio", label_format = 100, color = colorSel)
-dev.off()
-
-# GSEA analysis
-gene <- "FIBP"
-expFile <- "merge.normalize.txt"
-gmtFile <- "c2.cp.kegg.Hs.symbols.gmt"
-
-# Read and preprocess data
-rt <- read.table(expFile, header = TRUE, sep = "\t", check.names = FALSE)
-rt <- as.matrix(rt)
-rownames(rt) <- rt[, 1]
-exp <- rt[, 2:ncol(rt)]
-dimnames <- list(rownames(exp), colnames(exp))
-data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
-data <- avereps(data)
-data <- data[rowMeans(data) > 0, ]
-
-# Filter for treatment samples
-Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
-data <- data[, Type == "Treat", drop = FALSE]
-
-# Calculate logFC for target gene
-dataL <- data[, data[gene, ] < median(data[gene, ]), drop = FALSE]
-dataH <- data[, data[gene, ] >= median(data[gene, ]), drop = FALSE]
-meanL <- rowMeans(dataL)
-meanH <- rowMeans(dataH)
-meanL[meanL < 0.00001] <- 0.00001
-meanH[meanH < 0.00001] <- 0.00001
-logFC <- meanH - meanL
-logFC <- sort(logFC, decreasing = TRUE)
-genes <- names(logFC)
-
-# Read gene set file
-gmt <- read.gmt(gmtFile)
-
-# Perform GSEA
-kk <- GSEA(logFC, TERM2GENE = gmt, pvalueCutoff = 1)
-kkTab <- as.data.frame(kk)
-kkTab <- kkTab[kkTab$pvalue < 0.05, ]
-write.table(kkTab, file = "GSEA.result.txt", sep = "\t", quote = FALSE, row.names = FALSE)
-
-# Create enrichment plots for high expression group
-termNum <- 5
-kkUp <- kkTab[kkTab$NES > 0, ]
-if (nrow(kkUp) >= termNum) {
-  showTerm <- row.names(kkUp)[1:termNum]
-  gseaplot <- gseaplot2(kk, showTerm, base_size = 8, title = "Enriched in high expression group")
-  pdf(file = "GSEA.highExp.pdf", width = 6.5, height = 5.5)
-  print(gseaplot)
-  dev.off()
-}
-
-# Create enrichment plots for low expression group
-termNum <- 5
-kkDown <- kkTab[kkTab$NES < 0, ]
-if (nrow(kkDown) >= termNum) {
-  showTerm <- row.names(kkDown)[1:termNum]
-  gseaplot <- gseaplot2(kk, showTerm, base_size = 8, title = "Enriched in low expression group")
-  pdf(file = "GSEA.lowExp.pdf", width = 6.5, height = 5.5)
-  print(gseaplot)
-  dev.off()
-}
-
-# Machine learning modeling function
-RunRF <- function(Train_set, train_label, mode = "XXX") {
-  # Random forest implementation
-  # [Implementation details would go here]
-}
-
-# Load required libraries
-library(openxlsx)
-
-# Read method list
-methods <- read.xlsx("./data/Machine_learning_methods.xlsx")$Model
-methods <- gsub("-| ", "", methods)
-
-# Pre-training feature extraction
-min.selected.var <- 2
-Variable <- colnames(Train_set)
-preTrain.method <- strsplit(methods, "\\+")
-preTrain.method <- lapply(preTrain.method, function(x) rev(x)[-1])
-preTrain.method <- unique(unlist(preTrain.method))
-
-# Feature selection using various methods
-set.seed(seed = 123)
-preTrain.var <- list()
-for (method in preTrain.method) {
-  preTrain.var[[method]] <- RunML(method = method,
-                                  Train_expr = Train_set,
-                                  Train_surv = train_label,
-                                  mode = "Variable")
-}
-preTrain.var[["simple"]] <- colnames(Train_set)
-
-# Model training
-model <- list()
-set.seed(seed = 123)
-for (method in methods) {
-  cat(match(method, methods), ":", method, "\n")
-  method_name <- method
-  method <- strsplit(method, "\\+")[[1]]
   
-  if (length(method) == 1) method <- c("simple", method)
-  selected.var <- preTrain.var[[method[1]]]
-  
-  if (length(selected.var) <= min.selected.var) {
-    model[[method_name]] <- NULL
-  } else {
-    model[[method_name]] <- RunML(method = method[2],
-                                  Train_expr = Train_set[, selected.var],
-                                  Train_surv = train_label,
-                                  mode = "Model")
+  # Create enrichment plots for low expression group
+  termNum <- 5
+  kkDown <- kkTab[kkTab$NES < 0, ]
+  if (nrow(kkDown) >= termNum) {
+    showTerm <- row.names(kkDown)[1:termNum]
+    gseaplot <- gseaplot2(kk, showTerm, base_size = 8, title = "Enriched in low expression group")
+    pdf(file = "GSEA.lowExp.pdf", width = 6.5, height = 5.5)
+    print(gseaplot)
+    dev.off()
   }
+  
+  return(kkTab)
 }
 
-# Extract features from models
-fea_df <- lapply(model, function(fit) {
-  data.frame(ExtractVar(fit))
-})
-fea_df <- do.call(rbind, fea_df)
-fea_df$algorithm <- gsub("(.+)\\.(.+$)", "\\1", rownames(fea_df))
-colnames(fea_df)[1] <- "features"
-write.table(fea_df, "./result/fea_df.xls", sep = "\t", row.names = FALSE, 
-            col.names = TRUE, quote = FALSE)
+perform_gsva_analysis <- function(gene = "FIBP", 
+                                  expFile = "merge.normalize.txt", 
+                                  gmtFile = "c2.cp.kegg.Hs.symbols.gmt") {
+  # Read and preprocess data
+  rt <- read.table(expFile, header = TRUE, sep = "\t", check.names = FALSE)
+  rt <- as.matrix(rt)
+  rownames(rt) <- rt[, 1]
+  exp <- rt[, 2:ncol(rt)]
+  dimnames <- list(rownames(exp), colnames(exp))
+  data <- matrix(as.numeric(as.matrix(exp)), nrow = nrow(exp), dimnames = dimnames)
+  data <- avereps(data)
+  
+  # Filter for treatment samples
+  Type <- gsub("(.*)\\_(.*)\\_(.*)", "\\3", colnames(data))
+  data <- data[, Type == "Treat", drop = FALSE]
+  
+  # Read gene set file
+  geneSets <- getGmt(gmtFile, geneIdType = SymbolIdentifier())
+  
+  # Perform GSVA
+  gsvaScore <- gsva(data, geneSets, method = 'ssgsea', kcdf = 'Gaussian', abs.ranking = TRUE)
+  
+  # Normalize scores
+  normalize <- function(x) {
+    return((x - min(x)) / (max(x) - min(x)))
+  }
+  gsvaScore <- normalize(gsvaScore)
+  gsvaScore <- gsvaScore[apply(gsvaScore, 1, sd) > 0.01, ]
+  
+  # Group samples based on target gene expression
+  lowName <- colnames(data)[data[gene, ] < median(data[gene, ])]
+  highName <- colnames(data)[data[gene, ] >= median(data[gene, ])]
+  lowScore <- gsvaScore[, lowName]
+  highScore <- gsvaScore[, highName]
+  data <- cbind(lowScore, highScore)
+  conNum <- ncol(lowScore)
+  treatNum <- ncol(highScore)
+  Type <- c(rep("Control", conNum), rep("Treat", treatNum))
+  
+  # Statistical testing for each pathway
+  outTab <- data.frame()
+  for(i in row.names(data)) {
+    test <- t.test(data[i, ] ~ Type)
+    t <- test$statistic
+    pvalue <- test$p.value
+    if(test$estimate[2] > test$estimate[1]) {
+      t <- abs(t)
+    } else {
+      t <- -abs(t)
+    }
+    Sig <- ifelse(pvalue > 0.05, "Not", ifelse(t > 0, "Up", "Down"))
+    outTab <- rbind(outTab, cbind(Pathway = i, t, pvalue, Sig))
+  }
+  
+  # Create barplot
+  pdf(file = "barplot.pdf", width = 10.5, height = 7)
+  outTab$t <- as.numeric(outTab$t)
+  outTab$Sig <- factor(outTab$Sig, levels = c("Down", "Not", "Up"))
+  gg1 <- ggbarplot(outTab, x = "Pathway", y = "t", fill = "Sig", color = "white",
+                   palette = c("green3", "grey", "red3"), sort.val = "asc", sort.by.groups = TRUE,
+                   rotate = TRUE, title = gene, legend.title = "Group", legend = "right",
+                   xlab = "", ylab = "t value of GSVA score", x.text.angle = 60)
+  print(gg1)
+  dev.off()
+  
+  return(outTab)
+}
 
+###############################################################################
+# 8. MAIN EXECUTION FUNCTION
+###############################################################################
+
+main <- function() {
+  # Step 1: Process individual GEO datasets
+  # process_geo_data("geneMatrix.txt", "s1.txt", "s2.txt", "GSE5281")
+  
+  # Step 2: Integrate and batch correct multiple datasets
+  # integrated_data <- integrate_and_batch_correct()
+  
+  # Step 3: Create visualizations
+  # bioBoxplot(inputFile = "merge.preNorm.txt", outFile = "boxplot.preNorm.pdf", 
+  #            titleName = "Before batch correction")
+  # bioBoxplot(inputFile = "merge.normalize.txt", outFile = "boxplot.normalize.pdf", 
+  #            titleName = "After batch correction")
+  # bioPCA(inputFile = "merge.preNorm.txt", outFile = "PCA.preNorm.pdf", 
+  #        titleName = "Before batch correction")
+  # bioPCA(inputFile = "merge.normalize.txt", outFile = "PCA.normalize.pdf", 
+  #        titleName = "After batch correction")
+  
+  # Step 4: Perform differential expression analysis
+  # diff_genes <- perform_de_analysis()
+  
+  # Step 5: Perform WGCNA analysis
+  # wgcna_results <- perform_wgcna_analysis()
+  
+  # Step 6: Perform enrichment analysis
+  # go_results <- perform_go_enrichment()
+  # kegg_results <- perform_kegg_enrichment()
+  
+  # Step 7: Perform GSEA and GSVA analysis
+  # gsea_results <- perform_gsea_analysis()
+  # gsva_results <- perform_gsva_analysis()
+  
+  cat("Analysis pipeline complete. Please uncomment the desired steps in the main function.\n")
+}
+
+# Execute the main function
+main()
